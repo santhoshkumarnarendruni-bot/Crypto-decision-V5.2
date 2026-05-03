@@ -1,0 +1,1161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crypto Decision Engine v5.2 - Dynamic Entry + v3.8 Reference</title>
+
+<style>
+  body {
+    background:#0b0f14;
+    color:white;
+    font-family:Arial, sans-serif;
+    font-size:13px;
+    padding:15px;
+    max-width:760px;
+    margin:auto;
+  }
+
+  h2, h3 { margin-bottom:8px; }
+
+  .sub {
+    color:#aaa;
+    font-size:12px;
+    line-height:1.4;
+  }
+
+  select,input,button {
+    width:100%;
+    box-sizing:border-box;
+    padding:7px;
+    margin-top:6px;
+    border-radius:5px;
+    border:1px solid #2b3643;
+    background:#101820;
+    color:white;
+    font-size:12px;
+  }
+
+  button {
+    background:#2ecc71;
+    border:none;
+    color:white;
+    font-weight:bold;
+    cursor:pointer;
+  }
+
+  .card {
+    background:#151c24;
+    padding:15px;
+    margin-top:15px;
+    border-radius:10px;
+    line-height:1.55;
+  }
+
+  table {
+    width:100%;
+    border-collapse:collapse;
+    margin-top:10px;
+  }
+
+  td, th {
+    border-bottom:1px solid #2b3643;
+    padding:7px;
+    text-align:left;
+    vertical-align:top;
+  }
+
+  th { color:#f1c40f; }
+
+  .yes { color:#2ecc71; font-weight:bold; }
+  .no { color:#e74c3c; font-weight:bold; }
+  .skip { color:#aaa; font-weight:bold; }
+  .info { color:#f1c40f; }
+  .conf { color:#3498db; font-weight:bold; }
+  .warn { color:#f39c12; font-weight:bold; }
+  .small { font-size:12px; color:#aaa; }
+  .conf1 { color:#3498db; }
+
+  .probRow {
+    display:flex;
+    justify-content:space-between;
+    gap:25px;
+    font-size:18px;
+  }
+
+  .scalpBox {
+    border:1px solid #2b3643;
+    border-radius:8px;
+    padding:10px;
+    margin-top:10px;
+    background:#101820;
+  }
+
+  .scalpTitle {
+    font-size:16px;
+    font-weight:bold;
+  }
+
+  .finalSafeBox {
+    padding:14px;
+    border-radius:10px;
+    margin-bottom:14px;
+    border:2px solid #2b3643;
+  }
+  .finalSafeBox.yesBox { background:#0f2e1f; border-color:#2ecc71; }
+  .finalSafeBox.noBox { background:#2e0f0f; border-color:#e74c3c; }
+  .finalSafeBox.warnBox { background:#2e2a0f; border-color:#f1c40f; }
+  .finalSafeTitle { font-size:22px; margin:0 0 8px 0; }
+  .metricGrid {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:7px;
+    margin-top:10px;
+  }
+  .metricItem {
+    background:#101820;
+    padding:7px;
+    border-radius:6px;
+    border:1px solid #2b3643;
+  }
+
+</style>
+</head>
+
+<body>
+
+<h3>Crypto Decision Engine v5.2</h3><div class='sub'>Dynamic entry timing + full auto final signal + original v3.8 results kept for reference.</div>
+
+
+<select id="coin">
+  <option value="BTC-USD">BTC</option>
+  <option value="ETH-USD">ETH</option>
+  <option value="SOL-USD">SOL</option>
+  <option value="XRP-USD">XRP</option>
+  <option value="DOGE-USD">DOGE</option>
+  <option value="BNB-USD">BNB</option>
+  <option value="HYPE-USD">HYPE</option>
+</select>
+
+<input id="target" type="number" step="0.01" placeholder="Enter target price manually">
+<input id="market" type="number" step="0.01" min="0" max="1" placeholder="Market YES probability optional, example 0.62">
+
+<button onclick="run()">Analyze</button>
+
+<div id="result"></div>
+
+<script>
+function $(id){
+  return document.getElementById(id);
+}
+
+async function fetchJson(url){
+  const res = await fetch(url, { cache: "no-store" });
+  if(!res.ok) throw new Error("HTTP " + res.status + " for " + url);
+  return await res.json();
+}
+
+function candleFromArray(c){
+  return {
+    time: Number(c[0]) * 1000,
+    low: Number(c[1]),
+    high: Number(c[2]),
+    open: Number(c[3]),
+    close: Number(c[4]),
+    volume: Number(c[5])
+  };
+}
+
+function ohlc4(c){
+  return (Number(c.open) + Number(c.high) + Number(c.low) + Number(c.close)) / 4;
+}
+
+function getNextBoundaryMs(){
+  const fifteen = 15 * 60 * 1000;
+  return Math.floor(Date.now() / fifteen) * fifteen + fifteen;
+}
+
+function getTimeLeftMin(){
+  return Math.max(0, (getNextBoundaryMs() - Date.now()) / 60000);
+}
+
+async function getTicker(product){
+  const data = await fetchJson(`https://api.exchange.coinbase.com/products/${product}/ticker`);
+  if(!data.price) throw new Error("Ticker unavailable for " + product);
+  return Number(data.price);
+}
+
+async function getCandles(product, granularity = 60){
+  const url = `https://api.exchange.coinbase.com/products/${product}/candles?granularity=${granularity}`;
+  const data = await fetchJson(url);
+
+  if(!Array.isArray(data) || data.length === 0){
+    throw new Error("No candle data for " + product);
+  }
+
+  return data.map(candleFromArray).sort((a,b) => a.time - b.time);
+}
+
+function getPriceAgo(candles, mins){
+  const t = Date.now() - mins * 60000;
+  return candles.reduce((prev, curr) =>
+    Math.abs(curr.time - t) < Math.abs(prev.time - t) ? curr : prev
+  ).close;
+}
+
+function RSI(closes){
+  let gain = 0;
+  let loss = 0;
+
+  for(let i = 1; i < closes.length; i++){
+    const diff = closes[i] - closes[i - 1];
+    if(diff > 0) gain += diff;
+    else loss -= diff;
+  }
+
+  const rs = gain / (loss || 1);
+  return 100 - (100 / (1 + rs));
+}
+
+function VOL(closes){
+  let total = 0;
+
+  for(let i = 1; i < closes.length; i++){
+    total += Math.abs(closes[i] - closes[i - 1]);
+  }
+
+  return total / Math.max(1, closes.length - 1);
+}
+
+function EMA(values, period){
+  if(values.length === 0) return 0;
+
+  const k = 2 / (period + 1);
+  let ema = values[0];
+
+  for(let i = 1; i < values.length; i++){
+    ema = (values[i] * k) + (ema * (1 - k));
+  }
+
+  return ema;
+}
+
+function VWAP(candles){
+  let pv = 0;
+  let v = 0;
+
+  candles.forEach(c => {
+    const typical = (c.high + c.low + c.close) / 3;
+    pv += typical * c.volume;
+    v += c.volume;
+  });
+
+  return v ? pv / v : candles[candles.length - 1].close;
+}
+
+function avgVolume(candles){
+  if(!candles.length) return 0;
+  return candles.reduce((sum, c) => sum + c.volume, 0) / candles.length;
+}
+
+/*
+  2-confirmation check:
+  It stores the last strong signal in localStorage.
+  A BET becomes final only after the same BET appears at least 2 times.
+*/
+function applyConfirmation(product, rawDecision, timing){
+  const keySignal = "signal_" + product;
+  const keyCount = "signalCount_" + product;
+
+  const lastSignal = localStorage.getItem(keySignal);
+  let signalCount = Number(localStorage.getItem(keyCount) || 0);
+
+  if(rawDecision === lastSignal && rawDecision !== "SKIP" && rawDecision !== "WATCH ONLY"){
+    signalCount++;
+  } else {
+    signalCount = 1;
+  }
+
+  localStorage.setItem(keySignal, rawDecision);
+  localStorage.setItem(keyCount, signalCount);
+
+  if((rawDecision === "BET YES" || rawDecision === "BET NO") && signalCount < 2){
+    return {
+      decision: "WATCH ONLY",
+      cls: "skip",
+      timing: "WAIT FOR 2 CONFIRMATIONS",
+      confirmationCount: signalCount
+    };
+  }
+
+  return {
+    decision: rawDecision,
+    cls: rawDecision === "BET YES" ? "yes" : rawDecision === "BET NO" ? "no" : "skip",
+    timing,
+    confirmationCount: signalCount
+  };
+}
+
+
+
+function getFinalSignalV5({ price, target, projectedAvg, latestAvg, vwap, trend5, trend10, trend15, volatility, timeLeft, latestCandleGreen, latestCandleRed }){
+  const safeVol = volatility && volatility > 0 ? volatility : 1;
+  const flipRiskRatio = Math.abs(projectedAvg - target) / safeVol;
+
+  const yesAgreement =
+    (price > target ? 1 : 0) +
+    (projectedAvg > target ? 1 : 0) +
+    (latestAvg > target ? 1 : 0) +
+    (price > vwap ? 1 : 0) +
+    (trend5 > 0 ? 1 : 0) +
+    (latestCandleGreen ? 1 : 0);
+
+  const noAgreement =
+    (price < target ? 1 : 0) +
+    (projectedAvg < target ? 1 : 0) +
+    (latestAvg < target ? 1 : 0) +
+    (price < vwap ? 1 : 0) +
+    (trend5 < 0 ? 1 : 0) +
+    (latestCandleRed ? 1 : 0);
+
+  const trend5And10Bullish = trend5 > 0 && trend10 > 0;
+  const trend5And10Bearish = trend5 < 0 && trend10 < 0;
+
+  const strongYesCore =
+    yesAgreement >= 5 &&
+    price > target &&
+    projectedAvg > target &&
+    latestAvg > target &&
+    price > vwap;
+
+  const strongNoCore =
+    noAgreement >= 5 &&
+    price < target &&
+    projectedAvg < target &&
+    latestAvg < target &&
+    price < vwap;
+
+  const veryStrongBuffer = flipRiskRatio >= 3.0;
+  const goodBuffer = flipRiskRatio >= 2.5;
+  const mediumBuffer = flipRiskRatio >= 2.0;
+
+  let signal = "UNSAFE / WAIT";
+  let cls = "warn";
+  let alertMsg = "";
+  let entryTiming = "WAIT";
+  let reason = "Conditions are not aligned enough for a safer entry.";
+
+  // Dynamic timing windows:
+  // 7–10 min: enter only if very strong
+  // 5–7 min: enter if strong/good buffer
+  // 3–5 min: last-entry only if strong
+  // <3 min: avoid unless extremely strong, because payout/flip risk can be bad
+  // >10 min: usually too early
+
+  if(strongYesCore && veryStrongBuffer && trend5And10Bullish && timeLeft >= 7 && timeLeft <= 10){
+    signal = "SAFE TO BET YES";
+    cls = "yes";
+    entryTiming = "ENTER EARLY - STRONG SIGNAL";
+    alertMsg = "🚨 EARLY ENTRY: BUY YES";
+    reason = "YES has strong agreement, strong 5m/10m trend, and large flip-risk buffer. Do not wait too long if Coinbase may close early.";
+  }
+  else if(strongNoCore && veryStrongBuffer && trend5And10Bearish && timeLeft >= 7 && timeLeft <= 10){
+    signal = "SAFE TO BET NO";
+    cls = "no";
+    entryTiming = "ENTER EARLY - STRONG SIGNAL";
+    alertMsg = "🚨 EARLY ENTRY: BUY NO";
+    reason = "NO has strong agreement, strong 5m/10m trend, and large flip-risk buffer. Do not wait too long if Coinbase may close early.";
+  }
+  else if(strongYesCore && goodBuffer && timeLeft >= 5 && timeLeft < 7){
+    signal = "SAFE TO BET YES";
+    cls = "yes";
+    entryTiming = "ENTER NOW";
+    alertMsg = "🚨 ENTRY NOW: BUY YES";
+    reason = "YES has enough agreement and buffer in the practical Coinbase entry window.";
+  }
+  else if(strongNoCore && goodBuffer && timeLeft >= 5 && timeLeft < 7){
+    signal = "SAFE TO BET NO";
+    cls = "no";
+    entryTiming = "ENTER NOW";
+    alertMsg = "🚨 ENTRY NOW: BUY NO";
+    reason = "NO has enough agreement and buffer in the practical Coinbase entry window.";
+  }
+  else if(strongYesCore && goodBuffer && timeLeft >= 3 && timeLeft < 5){
+    signal = "SAFE TO BET YES";
+    cls = "yes";
+    entryTiming = "LAST ENTRY - ONLY IF ODDS OK";
+    alertMsg = "🚨 LAST ENTRY: BUY YES";
+    reason = "YES remains strong late, but check Coinbase liquidity/price before entering.";
+  }
+  else if(strongNoCore && goodBuffer && timeLeft >= 3 && timeLeft < 5){
+    signal = "SAFE TO BET NO";
+    cls = "no";
+    entryTiming = "LAST ENTRY - ONLY IF ODDS OK";
+    alertMsg = "🚨 LAST ENTRY: BUY NO";
+    reason = "NO remains strong late, but check Coinbase liquidity/price before entering.";
+  }
+  else if(timeLeft > 10){
+    signal = "UNSAFE / WAIT - TOO EARLY";
+    cls = "warn";
+    entryTiming = "WAIT";
+    reason = "More than 10 minutes left. Direction can still change too much.";
+  }
+  else if(timeLeft > 7 && timeLeft <= 10 && (strongYesCore || strongNoCore) && !veryStrongBuffer){
+    signal = "WATCH - STRONG BUT BUFFER NOT ENOUGH";
+    cls = "warn";
+    entryTiming = "WAIT FOR BETTER BUFFER";
+    reason = "Signal is forming early, but flip-risk buffer is not strong enough for early entry.";
+  }
+  else if(timeLeft < 3 && (strongYesCore || strongNoCore) && veryStrongBuffer){
+    signal = strongYesCore ? "RISKY LATE YES" : "RISKY LATE NO";
+    cls = strongYesCore ? "yes" : "no";
+    entryTiming = "ONLY IF ODDS ARE STILL WORTH IT";
+    alertMsg = strongYesCore ? "⚠️ LATE RISK: YES ONLY IF PRICE IS GOOD" : "⚠️ LATE RISK: NO ONLY IF PRICE IS GOOD";
+    reason = "Signal is strong, but under 3 minutes can have poor payout, fast flips, or closed market risk.";
+  }
+  else if(timeLeft < 3){
+    signal = "UNSAFE / WAIT - TOO LATE";
+    cls = "warn";
+    entryTiming = "SKIP";
+    reason = "Less than 3 minutes left and setup is not extremely strong.";
+  }
+  else if(flipRiskRatio < 2.0){
+    signal = "UNSAFE / WAIT - HIGH FLIP RISK";
+    cls = "warn";
+    entryTiming = "SKIP";
+    reason = "Projected average is too close to target compared with volatility.";
+  }
+  else if(yesAgreement < 5 && noAgreement < 5){
+    signal = "UNSAFE / WAIT - WEAK AGREEMENT";
+    cls = "warn";
+    entryTiming = "SKIP";
+    reason = "Not enough indicators agree on one side.";
+  }
+
+  let flipRiskLabel = "LOW";
+  if(flipRiskRatio < 1.2) flipRiskLabel = "VERY HIGH";
+  else if(flipRiskRatio < 2.0) flipRiskLabel = "HIGH";
+  else if(flipRiskRatio < 3.0) flipRiskLabel = "MEDIUM";
+
+  return {
+    signal,
+    cls,
+    alertMsg,
+    reason,
+    entryTiming,
+    flipRiskRatio,
+    flipRiskLabel,
+    yesAgreement,
+    noAgreement,
+    strongYesCore,
+    strongNoCore,
+    trend5And10Bullish,
+    trend5And10Bearish,
+    veryStrongBuffer,
+    goodBuffer,
+    mediumBuffer
+  };
+}
+
+
+function analyzeEngine({product, price, target, market, candles, rsi, vol, p5, p10, p15, latestAvg}){
+  const timeLeft = getTimeLeftMin();
+
+  const closes = candles.map(c => c.close);
+  const recentCandles = candles.slice(-30);
+  const latest = candles[candles.length - 1];
+
+  const ema9 = EMA(closes.slice(-30), 9);
+  const ema21 = EMA(closes.slice(-30), 21);
+  const vwap = VWAP(recentCandles);
+  const averageVolume = avgVolume(recentCandles.slice(0, -1));
+  const volumeSpike = latest.volume > averageVolume * 1.3;
+
+  const latestCandleGreen = latest.close > latest.open;
+  const latestCandleRed = latest.close < latest.open;
+
+  const trend5 = price - p5;
+  const trend10 = price - p10;
+  const trend15 = price - p15;
+
+  const trend5Positive = trend5 > 0;
+  const trend10Positive = trend10 > 0;
+  const trend15Positive = trend15 > 0;
+
+  const volatilityPct = vol / price;
+  const volatilityHigh = volatilityPct > 0.0018;
+  const volatilityVeryHigh = volatilityPct > 0.003;
+
+  /*
+    Prediction is based on projected resolving average, not live price alone.
+    This is still an approximation using Coinbase public 1-minute candle data.
+  */
+  const urgency = Math.max(0, Math.min(1, 1 - (timeLeft / 15)));
+  const trendProjection = (trend5 * 0.50) + (trend10 * 0.30) + (trend15 * 0.20);
+
+  const projectedAvg =
+    (latestAvg * (0.70 + urgency * 0.20)) +
+    (price * (0.30 - urgency * 0.20)) +
+    (trendProjection * 0.15);
+
+  const avgDistance = Math.abs(projectedAvg - target);
+  const cushionThreshold = vol * 1.5;
+  const avgCushion = projectedAvg - target;
+  const targetMagnetZone = Math.abs(avgCushion) < cushionThreshold * 1.15;
+
+  let yes = 0.50;
+  let confidence = 50;
+  const reasons = [];
+  const warnings = [];
+
+  if(projectedAvg > target){
+    yes += 0.16;
+    confidence += 10;
+    reasons.push("Projected average above target → YES support");
+  } else {
+    yes -= 0.16;
+    confidence += 10;
+    reasons.push("Projected average below target → NO support");
+  }
+
+  if(latestAvg > target){
+    yes += 0.09;
+    confidence += 7;
+    reasons.push("Latest 1-min average above target");
+  } else {
+    yes -= 0.09;
+    confidence += 7;
+    reasons.push("Latest 1-min average below target");
+  }
+
+  if(price > target){
+    yes += 0.06;
+    reasons.push("Live price above target");
+  } else {
+    yes -= 0.06;
+    reasons.push("Live price below target");
+  }
+
+  if(trend5Positive && trend10Positive){
+    yes += 0.07;
+    confidence += 8;
+    reasons.push("5m and 10m trend support YES");
+  }
+
+  if(!trend5Positive && !trend10Positive){
+    yes -= 0.07;
+    confidence += 8;
+    reasons.push("5m and 10m trend support NO");
+  }
+
+  if(ema9 > ema21){
+    yes += 0.05;
+    confidence += 4;
+    reasons.push("EMA 9 above EMA 21 → short-term bullish");
+  } else if(ema9 < ema21){
+    yes -= 0.05;
+    confidence += 4;
+    reasons.push("EMA 9 below EMA 21 → short-term bearish");
+  }
+
+  if(price > vwap){
+    yes += 0.04;
+    reasons.push("Price above VWAP → YES support");
+  } else if(price < vwap){
+    yes -= 0.04;
+    reasons.push("Price below VWAP → NO support");
+  }
+
+  if(latestCandleGreen){
+    yes += 0.03;
+    reasons.push("Latest candle green → small YES support");
+  } else if(latestCandleRed){
+    yes -= 0.03;
+    reasons.push("Latest candle red → small NO support");
+  }
+
+  if(rsi > 52 && rsi < 68){
+    yes += 0.04;
+    confidence += 3;
+    reasons.push("RSI bullish zone, not overbought");
+  } else if(rsi < 48 && rsi > 32){
+    yes -= 0.04;
+    confidence += 3;
+    reasons.push("RSI bearish zone, not oversold");
+  } else if(rsi >= 45 && rsi <= 55){
+    confidence -= 8;
+    warnings.push("RSI neutral → weak momentum");
+  } else if(rsi >= 70){
+    yes -= 0.04;
+    confidence -= 3;
+    warnings.push("RSI overbought → pullback risk");
+  } else if(rsi <= 30){
+    yes += 0.04;
+    confidence -= 3;
+    warnings.push("RSI oversold → bounce possible but unstable");
+  }
+
+  if(volumeSpike){
+    if(yes >= 0.50){
+      yes += 0.03;
+      reasons.push("Volume spike confirms current YES-leaning move");
+    } else {
+      yes -= 0.03;
+      reasons.push("Volume spike confirms current NO-leaning move");
+    }
+    confidence += 4;
+  }
+
+  if(!isNaN(market) && market >= 0 && market <= 1){
+    yes = (0.80 * yes) + (0.20 * market);
+    reasons.push("Adjusted slightly using entered market YES probability");
+  }
+
+  if(volatilityHigh){
+    confidence -= 12;
+    warnings.push("High volatility → target can flip quickly");
+  }
+
+  if(volatilityVeryHigh){
+    confidence -= 25;
+    warnings.push("Very high volatility → avoid unless signal is very strong");
+  }
+
+  const tooClose = avgDistance < vol * 1.0;
+
+  if(tooClose || targetMagnetZone){
+    confidence -= 25;
+    warnings.push("Target magnet zone → projected average too close to target");
+  }
+
+  if(timeLeft > 6 && volatilityHigh){
+    confidence -= 8;
+    warnings.push("More than 6 min left + high volatility → early signal may flip");
+  }
+
+  if((trend5 > 0 && trend10 < 0) || (trend5 < 0 && trend10 > 0)){
+    confidence -= 15;
+    warnings.push("Mixed 5m/10m trend → unstable direction");
+  }
+
+  if(timeLeft <= 2){
+    confidence += 5;
+    reasons.push("Low time left → current average has more importance");
+  }
+
+  yes = Math.max(0.05, Math.min(0.95, yes));
+  const no = 1 - yes;
+  confidence = Math.max(0, Math.min(100, Math.round(confidence)));
+
+  let yesScore = 0;
+  let noScore = 0;
+
+  if(price > target) yesScore++; else noScore++;
+  if(latestAvg > target) yesScore++; else noScore++;
+  if(projectedAvg > target) yesScore++; else noScore++;
+
+  if(trend5Positive && trend10Positive) yesScore++;
+  if(!trend5Positive && !trend10Positive) noScore++;
+
+  if(ema9 > ema21) yesScore++;
+  if(ema9 < ema21) noScore++;
+
+  if(price > vwap) yesScore++;
+  if(price < vwap) noScore++;
+
+  if(latestCandleGreen) yesScore++;
+  if(latestCandleRed) noScore++;
+
+  if(rsi > 52 && rsi < 68) yesScore++;
+  if(rsi < 48 && rsi > 32) noScore++;
+
+  if(volumeSpike){
+    if(yesScore > noScore) yesScore++;
+    if(noScore > yesScore) noScore++;
+  }
+
+  let cushionSignal = "NO CUSHION SIGNAL";
+  let cushionClass = "skip";
+  let cushionReason = "Projected average does not have enough safe distance from target.";
+
+  if(avgCushion >= cushionThreshold * 1.25 && yesScore >= 6){
+    cushionSignal = "AVG CUSHION SIGNAL: YES SIDE";
+    cushionClass = "yes";
+    cushionReason = "Projected average has cushion above target and indicators support YES.";
+  } else if(avgCushion <= -cushionThreshold * 1.25 && noScore >= 6){
+    cushionSignal = "AVG CUSHION SIGNAL: NO SIDE";
+    cushionClass = "no";
+    cushionReason = "Projected average has cushion below target and indicators support NO.";
+  } else if(Math.abs(avgCushion) < cushionThreshold * 1.15){
+    cushionSignal = "TARGET MAGNET: SKIP / WAIT";
+    cushionClass = "skip";
+    cushionReason = "Projected average is too close to target. One move can flip result.";
+  }
+
+  let earlyBias = "NO EARLY BIAS";
+  let earlyBiasClass = "skip";
+
+  const earlyYes =
+    timeLeft > 7 &&
+    price > target &&
+    latestAvg > target &&
+    projectedAvg > target &&
+    trend5Positive &&
+    trend10Positive &&
+    ema9 > ema21 &&
+    price > vwap &&
+    rsi > 52 &&
+    rsi < 68 &&
+    avgCushion >= cushionThreshold * 2 &&
+    yesScore >= 7;
+
+  const earlyNo =
+    timeLeft > 7 &&
+    price < target &&
+    latestAvg < target &&
+    projectedAvg < target &&
+    !trend5Positive &&
+    !trend10Positive &&
+    ema9 < ema21 &&
+    price < vwap &&
+    rsi < 48 &&
+    rsi > 32 &&
+    avgCushion <= -cushionThreshold * 2 &&
+    noScore >= 7;
+
+  if(earlyYes){
+    earlyBias = "EARLY BIAS: YES likely, wait for confirmation";
+    earlyBiasClass = "yes";
+  }
+
+  if(earlyNo){
+    earlyBias = "EARLY BIAS: NO likely, wait for confirmation";
+    earlyBiasClass = "no";
+  }
+
+  const earlyWindow = timeLeft > 6;
+  const idealEntryWindow = timeLeft <= 6 && timeLeft >= 3;
+  const lateWindow = timeLeft < 2;
+
+  let rawDecision = "SKIP";
+  let timing = confidence >= 70 ? "ENTER ONLY IF SIGNAL HOLDS" : "WAIT";
+
+  if(confidence < 60 || volatilityVeryHigh || tooClose || targetMagnetZone){
+    rawDecision = "SKIP";
+    timing = "AVOID / WAIT";
+  }
+  else if(earlyWindow){
+    rawDecision = "WATCH ONLY";
+    timing = earlyBias !== "NO EARLY BIAS" ? "EARLY BIAS ONLY - WAIT FOR 6 TO 3 MIN WINDOW" : "TOO EARLY - WAIT";
+  }
+  else if(
+    idealEntryWindow &&
+    confidence >= 65 &&
+    yes >= 0.66 &&
+    yesScore >= 7 &&
+    avgCushion >= cushionThreshold * 1.25 &&
+    price > target &&
+    latestAvg > target &&
+    projectedAvg > target &&
+    ema9 > ema21 &&
+    price > vwap &&
+    latestCandleGreen
+  ){
+    rawDecision = "BET YES";
+    timing = "IDEAL ENTRY WINDOW";
+  }
+  else if(
+    idealEntryWindow &&
+    confidence >= 65 &&
+    no >= 0.66 &&
+    noScore >= 7 &&
+    avgCushion <= -cushionThreshold * 1.25 &&
+    price < target &&
+    latestAvg < target &&
+    projectedAvg < target &&
+    ema9 < ema21 &&
+    price < vwap &&
+    latestCandleRed
+  ){
+    rawDecision = "BET NO";
+    timing = "IDEAL ENTRY WINDOW";
+  }
+  else if(
+    lateWindow &&
+    confidence >= 70 &&
+    Math.abs(avgCushion) >= cushionThreshold * 2 &&
+    ((yes > no && yesScore >= 7) || (no > yes && noScore >= 7))
+  ){
+    rawDecision = yes > no ? "BET YES" : "BET NO";
+    timing = "LATE ENTRY - LOWER RETURN";
+  }
+  else{
+    rawDecision = "SKIP";
+    timing = "WAIT";
+  }
+
+  const confirmed = applyConfirmation(product, rawDecision, timing);
+
+  let rsiSignal = "RSI NEUTRAL";
+  let rsiClass = "skip";
+
+  if(rsi > 52 && rsi < 68){
+    rsiSignal = "RSI BULLISH: YES support";
+    rsiClass = "yes";
+  } else if(rsi < 48 && rsi > 32){
+    rsiSignal = "RSI BEARISH: NO support";
+    rsiClass = "no";
+  } else if(rsi >= 70){
+    rsiSignal = "RSI OVERBOUGHT: Pullback risk";
+    rsiClass = "no";
+  } else if(rsi <= 30){
+    rsiSignal = "RSI OVERSOLD: Bounce risk";
+    rsiClass = "yes";
+  } else if(rsi >= 45 && rsi <= 55){
+    rsiSignal = "RSI NEUTRAL: Weak momentum";
+    rsiClass = "skip";
+  }
+
+
+  /*
+    SCALP MODE:
+    Separate from final-settlement betting.
+    Goal: buy cheap YES/NO near target magnet zone, then exit when probability reprices.
+  */
+  let scalpSignal = "NO SCALP SETUP";
+  let scalpClass = "skip";
+  let scalpAction = "No scalp trade. Wait.";
+  let scalpEntryZone = "None";
+  let scalpExitZone = "None";
+  let scalpStopZone = "None";
+  let scalpReason = "No clear short-term probability mispricing.";
+
+  const marketYes = (!isNaN(market) && market >= 0 && market <= 1) ? market : yes;
+  const marketNo = 1 - marketYes;
+
+  const yesMarketCheap = marketYes <= 0.35;
+  const noMarketCheap = marketNo <= 0.35;
+
+  const nearTargetForScalp = Math.abs(price - target) <= vol * 2.0 || targetMagnetZone;
+  const veryNearTarget = Math.abs(price - target) <= vol * 1.0 || targetMagnetZone;
+
+  const bouncePossible =
+    rsi <= 42 &&
+    rsi >= 25 &&
+    (latestCandleGreen || trend5 > trend10 || price >= latestAvg - vol);
+
+  const pullbackPossible =
+    rsi >= 58 &&
+    rsi <= 75 &&
+    (latestCandleRed || trend5 < trend10 || price <= latestAvg + vol);
+
+  const yesScalpSetup =
+    timeLeft >= 4 &&
+    timeLeft <= 12 &&
+    yesMarketCheap &&
+    nearTargetForScalp &&
+    bouncePossible &&
+    !volatilityVeryHigh;
+
+  const noScalpSetup =
+    timeLeft >= 4 &&
+    timeLeft <= 12 &&
+    noMarketCheap &&
+    nearTargetForScalp &&
+    pullbackPossible &&
+    !volatilityVeryHigh;
+
+  const yesExit1 = Math.min(0.50, marketYes + 0.12);
+  const yesExit2 = Math.min(0.60, marketYes + 0.20);
+  const noExit1 = Math.min(0.50, marketNo + 0.12);
+  const noExit2 = Math.min(0.60, marketNo + 0.20);
+
+  if(yesScalpSetup){
+    scalpSignal = "SCALP YES OPPORTUNITY";
+    scalpClass = "yes";
+    scalpAction = "Buy YES only for quick cash-out, not final hold.";
+    scalpEntryZone = `YES entry when market YES ≤ ${(marketYes * 100).toFixed(1)}% and price stays near target`;
+    scalpExitZone = `Take profit if YES moves to ${(yesExit1 * 100).toFixed(0)}%–${(yesExit2 * 100).toFixed(0)}%, or contract value gains 30%–80%`;
+    scalpStopZone = "Exit/avoid if price breaks strongly below target, RSI stays weak, or YES drops another 8%–10%";
+    scalpReason = "YES is cheap, price is near target, and RSI/candle suggest possible bounce.";
+  }
+  else if(noScalpSetup){
+    scalpSignal = "SCALP NO OPPORTUNITY";
+    scalpClass = "no";
+    scalpAction = "Buy NO only for quick cash-out, not final hold.";
+    scalpEntryZone = `NO entry when market NO ≤ ${(marketNo * 100).toFixed(1)}% and price stays near target`;
+    scalpExitZone = `Take profit if NO moves to ${(noExit1 * 100).toFixed(0)}%–${(noExit2 * 100).toFixed(0)}%, or contract value gains 30%–80%`;
+    scalpStopZone = "Exit/avoid if price breaks strongly above target, RSI stays strong, or NO drops another 8%–10%";
+    scalpReason = "NO is cheap, price is near target, and RSI/candle suggest possible pullback.";
+  }
+  else if(veryNearTarget && timeLeft >= 4 && timeLeft <= 12){
+    scalpSignal = "SCALP WATCHLIST";
+    scalpClass = "warn";
+    scalpAction = "Watch for cheap YES below 35% or cheap NO below 35%.";
+    scalpEntryZone = "Wait for one side to become underpriced while price stays near target.";
+    scalpExitZone = "Exit after 10%–20% probability move in your favor.";
+    scalpStopZone = "Avoid holding if price moves far away from target against your side.";
+    scalpReason = "Target magnet zone can create probability swings, but current price is not cheap enough.";
+  }
+
+  return {
+    yes,
+    no,
+    confidence,
+    decision: confirmed.decision,
+    cls: confirmed.cls,
+    timing: confirmed.timing,
+    confirmationCount: confirmed.confirmationCount,
+    reasons,
+    warnings,
+    trend5,
+    trend10,
+    trend15,
+    trend5Positive,
+    trend10Positive,
+    trend15Positive,
+    volatilityPct,
+    volatilityHigh,
+    volatilityVeryHigh,
+    latestAvg,
+    projectedAvg,
+    cushionThreshold,
+    avgCushion,
+    cushionSignal,
+    cushionClass,
+    cushionReason,
+    timeLeft,
+    ema9,
+    ema21,
+    vwap,
+    volumeSpike,
+    averageVolume,
+    latestVolume: latest.volume,
+    latestCandleGreen,
+    latestCandleRed,
+    yesScore,
+    noScore,
+    earlyBias,
+    earlyBiasClass,
+    rsiSignal,
+    rsiClass,
+    targetMagnetZone,
+    scalpSignal,
+    scalpClass,
+    scalpAction,
+    scalpEntryZone,
+    scalpExitZone,
+    scalpStopZone,
+    scalpReason,
+    finalSignal: getFinalSignalV5({
+      price,
+      target,
+      projectedAvg,
+      latestAvg,
+      vwap,
+      trend5,
+      trend10,
+      trend15,
+      volatility: vol,
+      timeLeft,
+      latestCandleGreen,
+      latestCandleRed
+    }),
+    marketYes,
+    marketNo
+  };
+}
+
+async function run(){
+  const savedScrollY = window.scrollY;
+  const product = $("coin").value;
+  const target = Number($("target").value);
+  const market = Number($("market").value);
+  const result = $("result");
+
+  if(!target || isNaN(target)){
+    alert("Enter target price manually");
+    return;
+  }
+
+  result.innerHTML = `<div class="card">Loading Coinbase data...</div>`;
+
+  try{
+    const candles = await getCandles(product, 60);
+
+    if(candles.length < 30){
+      throw new Error("Not enough candles");
+    }
+
+    const price = await getTicker(product);
+    const closes = candles.slice(-30).map(c => c.close);
+
+    const rsi = RSI(closes);
+    const vol = VOL(closes);
+
+    const p5 = getPriceAgo(candles, 5);
+    const p10 = getPriceAgo(candles, 10);
+    const p15 = getPriceAgo(candles, 15);
+
+    const latest = candles[candles.length - 1];
+    const latestAvg = ohlc4(latest);
+
+    const r = analyzeEngine({
+      product,
+      price,
+      target,
+      market,
+      candles,
+      rsi,
+      vol,
+      p5,
+      p10,
+      p15,
+      latestAvg
+    });
+
+    let volatilityMessage = "Normal volatility";
+    if(r.volatilityHigh) volatilityMessage = "High volatility — trade carefully";
+    if(r.volatilityVeryHigh) volatilityMessage = "Very high volatility — avoid trade";
+
+    const candleText = r.latestCandleGreen ? "Green candle" : r.latestCandleRed ? "Red candle" : "Flat candle";
+    const volumeText = r.volumeSpike ? "Volume spike" : "Normal volume";
+
+    result.innerHTML = `
+      <div class="card">
+
+        <div class="finalSafeBox ${r.finalSignal.cls === 'yes' ? 'yesBox' : r.finalSignal.cls === 'no' ? 'noBox' : 'warnBox'}">
+          <h2 class="finalSafeTitle ${r.finalSignal.cls}">${r.finalSignal.signal}</h2>
+          ${r.finalSignal.alertMsg ? `<div class="warn" style="font-size:16px;margin-bottom:8px;">${r.finalSignal.alertMsg}</div>` : ""}
+          <b>Entry Timing:</b> <span class="${r.finalSignal.cls}">${r.finalSignal.entryTiming}</span><br>
+          <b>Final Reason:</b> ${r.finalSignal.reason}<br>
+          <div class="metricGrid">
+            <div class="metricItem"><b>Flip Risk:</b> ${r.finalSignal.flipRiskLabel} (${r.finalSignal.flipRiskRatio.toFixed(2)})</div>
+            <div class="metricItem"><b>Time Left:</b> ${r.timeLeft.toFixed(1)} min</div>
+            <div class="metricItem"><b>YES Agreement:</b> <span class="yes">${r.finalSignal.yesAgreement}/6</span></div>
+            <div class="metricItem"><b>NO Agreement:</b> <span class="no">${r.finalSignal.noAgreement}/6</span></div>
+            <div class="metricItem"><b>5m+10m Bullish:</b> ${r.finalSignal.trend5And10Bullish ? '<span class="yes">Yes</span>' : '<span class="skip">No</span>'}</div>
+            <div class="metricItem"><b>5m+10m Bearish:</b> ${r.finalSignal.trend5And10Bearish ? '<span class="no">Yes</span>' : '<span class="skip">No</span>'}</div>
+          </div>
+          <div class="small" style="margin-top:8px;">
+            Use this FINAL SIGNAL first. v3.8 details below are kept only for reference.
+          </div>
+        </div>
+
+        <b>Coin:</b> ${product} &nbsp;&nbsp;<span> <b>Candle</b> ${r.latestCandleGreen ? '<span class="yes">' + candleText + '</span>' : r.latestCandleRed ? '<span class="no">' + candleText + '</span>' : '<span class="skip">' + candleText + '</span>'}</span> <br>
+        <b>Price:</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ${price.toFixed(4)} <span class="warn">(Coinbase)</span><br>
+        <b>Target:</b>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; ${target.toFixed(4)}<br>
+        <b>Projected:</b> <span class="info">${r.projectedAvg.toFixed(4)}</span><br>
+        <b>Time:</b> ${r.timeLeft.toFixed(1)} min &nbsp;&nbsp;&nbsp;
+ ${r.ema9 > r.ema21 ? '<span class="yes">Bullish</span>' : '<span class="no">Bearish</span>'}&nbsp;&nbsp ${r.trend5Positive ? "+P" : "-N"} &nbsp ${r.trend10Positive ? "+P" : "-N"} &nbsp ${r.trend15Positive ? "+P" : "-N"} <br>
+        <b>Trend Summary:</b>
+        5m ${r.trend5Positive ? '<span class="yes">Positive</span>' : '<span class="no">Negative</span>'} (${r.trend5.toFixed(4)}) |
+        10m ${r.trend10Positive ? '<span class="yes">Positive</span>' : '<span class="no">Negative</span>'} (${r.trend10.toFixed(4)}) |
+        15m ${r.trend15Positive ? '<span class="yes">Positive</span>' : '<span class="no">Negative</span>'} (${r.trend15.toFixed(4)})
+        <br><br>
+
+
+        <b>YES:</b> ${(r.yes * 100).toFixed(1)}% &nbsp;&nbsp;&nbsp;&nbsp;  <span> <b class="conf">Confidence:</b> ${r.confidence}% </span><br>
+        <b>NO:</b> ${(r.no * 100).toFixed(1)}% &nbsp;&nbsp;&nbsp;&nbsp;  <span><b>Confirmations:</b> ${r.confirmationCount}/2 </span><br>
+        <span class="small">Market input used for scalp: YES ${(r.marketYes * 100).toFixed(1)}% / NO ${(r.marketNo * 100).toFixed(1)}%</span><br>
+
+    
+        <b>Score:</b>YES <span class="yes">  ${r.yesScore}</span> / NO <span class="no">${r.noScore}</span><br><br>
+
+        <b>Timing:</b> ${r.timing}<br>
+        
+<b>Target Zone&nbsp;&nbsp;&nbsp;&nbsp;</b>${r.targetMagnetZone ? '<span class="warn">Not safe distance</span>' : '<span class="yes">Safe distance</span>'}<br>
+
+        <b>Volatility:</b> ${vol.toFixed(4)} &nbsp;&nbsp;
+        <span class="warn">${volatilityMessage}</span><br>
+
+        <b>RSI:</b> ${rsi.toFixed(2)}&nbsp;&nbsp;&nbsp;
+        <b class="${r.rsiClass}">${r.rsiSignal}</b><br><br>
+
+        <b class="${r.earlyBiasClass}">${r.earlyBias}</b><br>
+        <b class="${r.cushionClass}">${r.cushionSignal}</b><br>
+        <span class="small">${r.cushionReason}</span><br><br>
+
+        <h2 class="${r.cls}">${r.decision}</h2>
+
+        <div class="scalpBox">
+          <div class="scalpTitle ${r.scalpClass}">${r.scalpSignal}</div>
+          <b>Scalp Action:</b> ${r.scalpAction}<br>
+          <b>Entry Zone:</b> ${r.scalpEntryZone}<br>
+          <b>Exit Zone:</b> ${r.scalpExitZone}<br>
+          <b>Stop / Avoid:</b> ${r.scalpStopZone}<br>
+          <span class="small">${r.scalpReason}</span>
+        </div>
+
+<table>
+          <tr><th>Trend Status:</th><th>Prices:</th></tr>
+          <tr><td>5m Trend: ${r.trend5Positive ? "Positive" : "Negative"} (${r.trend5.toFixed(4)})</td><td>${p5.toFixed(4)}</td></tr>
+          <tr><td>10m Trend: ${r.trend10Positive ? "Positive" : "Negative"} (${r.trend10.toFixed(4)})</td><td>${p10.toFixed(4)}</td></tr>
+          <tr><td>15m Trend: ${r.trend15Positive ? "Positive" : "Negative"} (${r.trend15.toFixed(4)})</td><td>${p15.toFixed(4)}</td></tr>
+        </table>
+
+
+
+        
+        <div class="info">
+          <b>Why:</b><br>
+          ${r.reasons.join("<br>") || "No strong reason."}
+          <br><br>
+          <b>Risk Warnings:</b><br>
+          ${r.warnings.length ? r.warnings.join("<br>") : "No major warning"}
+        </div>
+
+        <br>
+        <table>
+          <tr><th>Indicator</th><th>Status</th></tr>
+          <tr><td>VWAP</td><td>${r.vwap.toFixed(4)} | ${price > r.vwap ? '<span class="yes">Price above VWAP</span>' : '<span class="no">Price below VWAP</span>'}</td></tr>
+          <tr><td>EMA 9 / EMA 21</td><td>${r.ema9.toFixed(4)} / ${r.ema21.toFixed(4)} | ${r.ema9 > r.ema21 ? '<span class="yes">Bullish</span>' : '<span class="no">Bearish</span>'}</td></tr>
+                    <tr><td>Volume</td><td>${r.latestVolume.toFixed(2)} vs avg ${r.averageVolume.toFixed(2)} | ${r.volumeSpike ? '<span class="yes">' + volumeText + '</span>' : '<span class="skip">' + volumeText + '</span>'}</td></tr>
+          
+        </table>
+
+
+        <div class="small">
+          Final bet: before 7 min = early bias only; 6–3 min = main entry window; under 2 min = only very strong late entry. Scalp mode is for quick cash-out probability movement, not final settlement.
+        </div>
+      </div>
+    `;
+
+  } catch(e){
+    console.error(e);
+
+    result.innerHTML = `
+      <div class="card">
+        <b class="no">Coinbase API Error</b><br><br>
+        ${e.message}<br><br>
+        <span class="small">
+          Try BTC-USD/ETH-USD first. Some coins may not exist on Coinbase Exchange.
+          If this fails only on laptop browser, try disabling extensions, using HTTPS hosting, or using another browser.
+        </span>
+      </div>
+    `;
+  } finally {
+    setTimeout(() => {
+      window.scrollTo(0, savedScrollY);
+    }, 0);
+  }
+}
+
+/*
+  Auto target refresh on coin change is removed.
+  Coin change clears target to avoid using old target by mistake.
+*/
+window.addEventListener("DOMContentLoaded", function(){
+  $("coin").addEventListener("change", function(){
+    $("result").innerHTML = "";
+    $("market").value = "";
+    $("target").value = "";
+
+    localStorage.removeItem("signal_" + $("coin").value);
+    localStorage.removeItem("signalCount_" + $("coin").value);
+  });
+});
+</script>
+
+</body>
+</html>
